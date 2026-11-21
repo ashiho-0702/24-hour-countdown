@@ -43,8 +43,8 @@ struct Theme {
     std::array<COLORREF, 6> colors;
 };
 
-constexpr int spectrumTheme = 1;
-extern const std::array<Theme, 2> themes;
+constexpr int daylightTheme = 0;
+extern const std::array<Theme, 7> themes;
 
 std::vector<const City*> citiesFor(const wchar_t* zone);
 Instant toInstant(FILETIME fileTime);

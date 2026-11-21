@@ -3,6 +3,8 @@
 #include "settings.h"
 
 #include <windowsx.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <shellapi.h>
 #include <algorithm>
 #include <cmath>
@@ -19,6 +21,8 @@ constexpr UINT restoreMessage = WM_APP + 2;
 constexpr UINT_PTR tickTimer = 1;
 constexpr int baseWidth = 746;
 constexpr int baseHeight = 115;
+constexpr int cornerDiameter = 21;
+constexpr int numeralTop = 31;
 constexpr COLORREF caseColor = RGB(43, 46, 51);
 constexpr COLORREF glassColor = RGB(11, 12, 15);
 constexpr COLORREF scaleInk = RGB(227, 226, 220);
@@ -171,14 +175,18 @@ private:
     void createControls();
     void placeWindow(bool restorePosition);
     void updateGeometry();
+    RECT closeButtonBounds(int clientWidth) const;
+    void syncShadow();
     void rememberPosition();
     void refresh(bool rebuild = false, bool forPreview = false);
     void paint(HDC target);
+    RECT timeBounds(int clientWidth) const;
+    void drawTime(HDC dc, int clientWidth) const;
     void drawFace(HDC dc, const RECT& client, int theme, double elapsed);
     void drawLamps(HDC dc, int trackStart, int trackWidth, int theme, double elapsed,
                    const std::vector<DWORD>& metal, const RECT& client);
     static INT_PTR CALLBACK paletteProcedure(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
-    void drawSolarMarks(HDC dc, int trackStart, int trackWidth);
+    void drawSolarMarks(HDC dc, int trackStart, int trackWidth, int clientWidth);
     void drawHideButton(const DRAWITEMSTRUCT& item);
 
     bool addTrayIcon();
@@ -193,6 +201,8 @@ private:
     HICON smallIcon_;
     HWND window_ = nullptr;
     HWND hideButton_ = nullptr;
+    HWND shadow_ = nullptr;
+    SIZE shadowSize_{};
     UINT dpi_ = 96;
     UINT taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -216,6 +226,9 @@ bool App::create() {
     }
     placeWindow(true);
     updateGeometry();
+    shadow_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                              L"STATIC", L"Countdown shadow", WS_POPUP, 0, 0, 0, 0,
+                              window_, nullptr, instance_, nullptr);
     useTaskbarButton(!addTrayIcon());
     show();
     return true;
@@ -252,13 +265,83 @@ void App::placeWindow(bool restorePosition) {
     SetWindowPos(window_, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+RECT App::closeButtonBounds(int clientWidth) const {
+    const int inset = (scale(cornerDiameter) + 1) / 2 + scale(1);
+    const int side = scale(numeralTop) - inset;
+    return {clientWidth - inset - side, inset, clientWidth - inset, inset + side};
+}
+
 void App::updateGeometry() {
     RECT client{};
     GetClientRect(window_, &client);
-    const HRGN corners = CreateRoundRectRgn(0, 0, client.right + 1, client.bottom + 1, scale(21), scale(21));
+    const int diameter = scale(cornerDiameter);
+    const HRGN corners = CreateRoundRectRgn(0, 0, client.right + 1, client.bottom + 1, diameter, diameter);
     if (corners && !SetWindowRgn(window_, corners, TRUE)) DeleteObject(corners);
-    SetWindowPos(hideButton_, nullptr, scale(713), scale(11), scale(19), scale(17), SWP_NOZORDER | SWP_NOACTIVATE);
+    const RECT button = closeButtonBounds(client.right);
+    SetWindowPos(hideButton_, nullptr, button.left, button.top, button.right - button.left,
+                 button.bottom - button.top, SWP_NOZORDER | SWP_NOACTIVATE);
     InvalidateRect(window_, nullptr, FALSE);
+}
+
+void renderShadow(DWORD* pixels, SIZE size, int width, int height, int pad, double unit, double radius) {
+    for (int y = 0; y < size.cy; ++y) {
+        for (int x = 0; x < size.cx; ++x) {
+            const double dx = std::abs(x + 0.5 - pad - width * 0.5) - (width * 0.5 - radius);
+            const double py = y + 0.5 - pad - height * 0.5;
+            const auto distance = [&](double offset) {
+                const double dy = std::abs(py - offset * unit) - (height * 0.5 - radius);
+                return (std::hypot(std::max(dx, 0.0), std::max(dy, 0.0))
+                        + std::min(std::max(dx, dy), 0.0) - radius) / unit;
+            };
+            DWORD alpha = 0;
+            if (distance(0) > 0) {
+                alpha = static_cast<DWORD>(34 * std::erfc(distance(5) / 8.5)
+                                           + 20 * std::erfc(distance(1) / 2.8));
+            }
+            *pixels++ = alpha << 24;
+        }
+    }
+}
+
+void App::syncShadow() {
+    if (!shadow_) return;
+    if (!IsWindowVisible(window_) || IsIconic(window_)) {
+        ShowWindow(shadow_, SW_HIDE);
+        return;
+    }
+    RECT panel{};
+    GetWindowRect(window_, &panel);
+    const int pad = scale(22);
+    const int width = panel.right - panel.left;
+    const int height = panel.bottom - panel.top;
+    POINT origin{panel.left - pad, panel.top - pad};
+    SIZE size{width + 2 * pad, height + 2 * pad};
+    if (size.cx != shadowSize_.cx || size.cy != shadowSize_.cy) {
+        BITMAPINFO info{};
+        info.bmiHeader = {sizeof(BITMAPINFOHEADER), size.cx, -size.cy, 1, 32, BI_RGB};
+        void* bits = nullptr;
+        HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        HDC dc = CreateCompatibleDC(nullptr);
+        if (!bitmap || !dc) {
+            if (bitmap) DeleteObject(bitmap);
+            if (dc) DeleteDC(dc);
+            return;
+        }
+        const auto original = SelectObject(dc, bitmap);
+        DWORD* pixels = static_cast<DWORD*>(bits);
+        renderShadow(pixels, size, width, height, pad, dpi_ / 96.0, scale(cornerDiameter) * 0.5);
+        POINT start{};
+        BLENDFUNCTION blendFunction{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        const BOOL ok = UpdateLayeredWindow(shadow_, nullptr, &origin, &size, dc, &start, 0,
+                                            &blendFunction, ULW_ALPHA);
+        SelectObject(dc, original);
+        DeleteDC(dc);
+        DeleteObject(bitmap);
+        if (!ok) return;
+        shadowSize_ = size;
+    }
+    SetWindowPos(shadow_, nullptr, origin.x, origin.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
 }
 
 void App::rememberPosition() {
@@ -286,7 +369,6 @@ void App::refresh(bool rebuild, bool forPreview) {
     if (!SystemTimeToTzSpecificLocalTimeEx(&zone_, &utc, &local)) local = utc;
     if (!day_ || local.wYear != localDate_.wYear || local.wMonth != localDate_.wMonth
         || local.wDay != localDate_.wDay) {
-        localDate_ = local;
         day_ = Day::build(local, zone_, selectedCoordinates(preferences_, zone_));
         rebuild = true;
     }
@@ -299,15 +381,42 @@ void App::refresh(bool rebuild, bool forPreview) {
         const Instant minute = now - now % ticksPerMinute;
         if (duration > 0) newlyElapsed += std::clamp(static_cast<double>(minute - start) / duration, 0.0, 1.0);
     }
-    if (rebuild || newlyElapsed != elapsed_) InvalidateRect(window_, nullptr, FALSE);
+    if (rebuild || newlyElapsed != elapsed_) {
+        InvalidateRect(window_, nullptr, FALSE);
+    } else if (local.wMinute != localDate_.wMinute ||
+               local.wHour != localDate_.wHour) {
+        const RECT bounds = timeBounds(scale(baseWidth));
+        InvalidateRect(window_, &bounds, FALSE);
+    }
+    localDate_ = local;
     elapsed_ = newlyElapsed;
 
     if (!visible) return;
-    const Instant untilChange = ticksPerMinute - now % ticksPerMinute;
-    const Instant milliseconds = (untilChange + ticksPerMillisecond - 1) / ticksPerMillisecond;
-    SetTimer(window_, tickTimer, static_cast<UINT>(std::clamp<Instant>(milliseconds, 50, 1'800'000)), nullptr);
+    SetTimer(window_, tickTimer, (60 - local.wSecond) * 1000 - local.wMilliseconds, nullptr);
 }
 
+RECT App::timeBounds(int clientWidth) const {
+    const RECT button = closeButtonBounds(clientWidth);
+    const int right = button.left - scale(5);
+    return {right - scale(45), button.top, right, scale(27)};
+}
+
+void App::drawTime(HDC dc, int clientWidth) const {
+    RECT bounds = timeBounds(clientWidth);
+    fill(dc, bounds, glassColor);
+    const HFONT font = CreateFontW(-scale(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        FIXED_PITCH | FF_MODERN, L"Consolas");
+    const auto old = SelectObject(dc, font ? font : GetStockObject(ANSI_FIXED_FONT));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(211, 217, 222));
+    wchar_t time[6]{};
+    swprintf_s(time, L"%02u:%02u", static_cast<unsigned>(localDate_.wHour),
+               static_cast<unsigned>(localDate_.wMinute));
+    DrawTextW(dc, time, 5, &bounds, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, old);
+    if (font) DeleteObject(font);
+}
 void App::drawFace(HDC dc, const RECT& client, int theme, double elapsed) {
     const auto pen = SelectObject(dc, GetStockObject(DC_PEN));
     const auto brush = SelectObject(dc, GetStockObject(DC_BRUSH));
@@ -321,11 +430,12 @@ void App::drawFace(HDC dc, const RECT& client, int theme, double elapsed) {
         return trackStart + MulDiv(trackWidth, tick, cellCount);
     };
     drawLamps(dc, trackStart, trackWidth, theme, elapsed, metal, client);
-    if (theme != spectrumTheme) drawSolarMarks(dc, trackStart, trackWidth);
+    drawTime(dc, client.right);
+    if (theme == daylightTheme) drawSolarMarks(dc, trackStart, trackWidth, client.right);
 
     const int digitWidth = scale(6);
     const int digitGap = scale(2);
-    const int digitTop = scale(31);
+    const int digitTop = scale(numeralTop);
     const int digitBottom = scale(48);
     for (int tick = 0; tick <= cellCount; ++tick) {
         const bool major = tick % 2 == 0;
@@ -356,7 +466,7 @@ void App::drawLamps(HDC dc, int trackStart, int trackWidth, int theme, double el
     const auto tickX = [trackStart, trackWidth](int tick) {
         return trackStart + MulDiv(trackWidth, tick, cellCount);
     };
-    const bool reference = day_ && theme == 0 && day_->sunrise >= 0 && day_->sunset >= 0;
+    const bool reference = day_ && theme == daylightTheme && day_->sunrise >= 0 && day_->sunset >= 0;
     const auto colorAt = [&](int x) {
         const double minute = (x - trackStart + 0.5) * minutesPerDay / trackWidth;
         if (reference) return sampleLens(referenceCell(*day_, minute), 0.5, 0.45);
@@ -365,22 +475,29 @@ void App::drawLamps(HDC dc, int trackStart, int trackWidth, int theme, double el
 
     roundRect(dc, {trackStart - scale(3), top - scale(2), tickX(cellCount) + scale(3),
                   bottom + scale(2)}, scale(5), RGB(5, 7, 9), RGB(3, 4, 6));
-    const int lightStart = trackStart + static_cast<int>(std::lround(trackWidth * elapsed / cellCount));
+    const double boundary = trackStart + trackWidth * elapsed / cellCount;
+    const int lightStart = static_cast<int>(std::floor(boundary));
+    const double fadeWidth = std::min(boundary - trackStart, 1.25 * trackWidth / cellCount);
+    const auto brightnessAt = [&](int x) {
+        if (fadeWidth <= 0) return 1.0;
+        const double t = std::clamp((x + 0.5 - boundary) / fadeWidth, 0.0, 1.0);
+        return t * t * (3.0 - 2.0 * t);
+    };
     if (day_) {
         for (int x = lightStart; x < std::min<int>(client.right, tickX(cellCount)); ++x) {
             const COLORREF tint = colorAt(x);
             const double strength = 0.40 + warmth(tint) * 0.22;
-            const double onset = std::clamp((x - lightStart + 0.5) / scale(6), 0.0, 1.0);
-            for (int y = scale(105); y < std::min<int>(client.bottom, scale(114)); ++y) {
+            const double onset = brightnessAt(x);
+            for (int y = scale(baseHeight - 10); y < std::min<int>(client.bottom, scale(baseHeight - 1)); ++y) {
                 const DWORD base = metal[static_cast<size_t>(y) * client.right + x];
                 const COLORREF steel = RGB(GetBValue(base), GetGValue(base), GetRValue(base));
-                const double distance = (y - scale(108)) / static_cast<double>(scale(3));
+                const double distance = (y - scale(baseHeight - 7)) / static_cast<double>(scale(3));
                 const double reflection = onset * strength * std::exp(-distance * distance);
                 SetPixelV(dc, x, y, blend(steel, tint, reflection));
             }
             for (int band = 0; band < halo; ++band) {
                 const double fade = 1.0 - static_cast<double>(band) / halo;
-                const COLORREF glow = blend(glassColor, tint, strength * fade * fade);
+                const COLORREF glow = blend(glassColor, tint, onset * strength * fade * fade);
                 SetPixelV(dc, x, top - 1 - band, glow);
                 SetPixelV(dc, x, bottom + band, glow);
             }
@@ -416,7 +533,7 @@ void App::drawLamps(HDC dc, int trackStart, int trackWidth, int theme, double el
             const double warm = warmth(tint);
             const double side = std::abs(2.0 * (x - left + 0.5) / width - 1.0);
             const COLORREF highlight = blend(RGB(179, 225, 255), RGB(255, 249, 215), warm);
-            const COLORREF center = blend(tint, highlight, theme == spectrumTheme ? 0.10 : 0.62);
+            const COLORREF center = blend(tint, highlight, theme == daylightTheme ? 0.62 : 0.10);
             const COLORREF edge = blend(glassColor, tint, 0.88);
             for (int y = top + 1; y < bottom - 1; ++y) {
                 const double position = static_cast<double>(y - top) / height;
@@ -426,14 +543,71 @@ void App::drawLamps(HDC dc, int trackStart, int trackWidth, int theme, double el
             }
         }
     }
-    const int active = static_cast<int>(elapsed);
-    if (active < cellCount && elapsed > active) {
-        const int left = tickX(active) + std::max(1, scale(1));
-        if (left < lightStart) fill(dc, {left, top, lightStart, bottom}, RGB(3, 5, 7));
+    if (elapsed > 0 && elapsed < cellCount) {
+        const int firstCell = static_cast<int>(elapsed);
+        const int end = std::min(tickX(cellCount), static_cast<int>(std::ceil(boundary + fadeWidth)));
+        for (int cell = firstCell; cell < cellCount && tickX(cell) < end; ++cell) {
+            const int left = tickX(cell) + std::max(1, scale(1));
+            const int right = tickX(cell + 1);
+            for (int x = left; x < std::min(right, end); ++x) {
+                const double light = brightnessAt(x);
+                for (int y = top; y < bottom; ++y) {
+                    const bool rim = x == left || x == right - 1 || y == top || y == bottom - 1;
+                    const COLORREF off = rim ? RGB(14, 16, 20) : RGB(3, 5, 7);
+                    SetPixelV(dc, x, y, blend(off, GetPixel(dc, x, y), light));
+                }
+            }
+        }
     }
 }
 
-void App::drawSolarMarks(HDC dc, int trackStart, int trackWidth) {
+bool vectorGraphicsReady() {
+    using namespace Gdiplus;
+    struct Rasterizer {
+        ULONG_PTR token{};
+        Rasterizer() {
+            GdiplusStartupInput input;
+            GdiplusStartup(&token, &input, nullptr);
+        }
+        ~Rasterizer() { if (token) GdiplusShutdown(token); }
+    };
+    static Rasterizer rasterizer;
+    return rasterizer.token != 0;
+}
+
+void drawSunIcon(HDC dc, int centerX, int baseline, UINT dpi) {
+    using namespace Gdiplus;
+    if (!vectorGraphicsReady()) return;
+
+    Graphics canvas(dc);
+    canvas.SetPageUnit(UnitPixel);
+    canvas.SetSmoothingMode(SmoothingModeAntiAlias);
+    canvas.SetPixelOffsetMode(PixelOffsetModeHalf);
+    const REAL unit = dpi / 96.0f;
+    Matrix transform(unit, 0, 0, unit, static_cast<REAL>(centerX), static_cast<REAL>(baseline));
+    canvas.SetTransform(&transform);
+
+    const Color amber(255, 240, 183, 101);
+    SolidBrush fill(amber);
+    GraphicsPath disc;
+    disc.AddArc(-4.0f, -4.0f, 8.0f, 8.0f, 180.0f, 180.0f);
+    disc.CloseFigure();
+    canvas.FillPath(&fill, &disc);
+
+    Pen stroke(amber, 1.0f);
+    stroke.SetLineCap(LineCapRound, LineCapRound, DashCapFlat);
+    GraphicsPath rays;
+    rays.AddLine(-5.5f, 1.7f, 5.5f, 1.7f);
+    rays.StartFigure();
+    rays.AddLine(0.0f, -7.0f, 0.0f, -5.6f);
+    rays.StartFigure();
+    rays.AddLine(-4.9f, -4.9f, -4.0f, -4.0f);
+    rays.StartFigure();
+    rays.AddLine(4.9f, -4.9f, 4.0f, -4.0f);
+    canvas.DrawPath(&stroke, &rays);
+}
+
+void App::drawSolarMarks(HDC dc, int trackStart, int trackWidth, int clientWidth) {
     if (!day_ || (day_->sunrise < 0 && day_->sunset < 0)) return;
     const HFONT font = CreateFontW(-scale(11), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -441,27 +615,43 @@ void App::drawSolarMarks(HDC dc, int trackStart, int trackWidth) {
     const HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(232, 194, 139));
-    const auto mark = [&](double minute, const wchar_t* text) {
-        if (minute < 0) return;
-        const int x = std::clamp(trackStart + static_cast<int>(minute * trackWidth / minutesPerDay),
-                                 trackStart + scale(20), trackStart + trackWidth - scale(34));
-        RECT title{x - scale(6), scale(11), x + scale(21), scale(28)};
-        DrawTextW(dc, text, -1, &title, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-
-        const int icon = x - scale(14);
-        SetDCPenColor(dc, RGB(240, 183, 101));
-        SetDCBrushColor(dc, RGB(240, 183, 101));
-        Pie(dc, icon - scale(4), scale(17), icon + scale(4), scale(25),
-            icon + scale(5), scale(21), icon - scale(5), scale(21));
-        line(dc, icon - scale(6), scale(23), icon + scale(6), scale(23));
-        line(dc, icon, scale(14), icon, scale(16));
+    struct Mark {
+        double minute;
+        const wchar_t* text;
+        int anchor{}, left{}, width{};
     };
-    const bool closeTogether = day_->sunrise >= 0 && day_->sunset >= 0
-        && std::abs(day_->sunrise - day_->sunset) * trackWidth / minutesPerDay < scale(47);
-    if (!closeTogether) {
-        mark(day_->sunrise, L"日出");
-        mark(day_->sunset, L"日落");
+    Mark marks[]{{day_->sunrise, L"日出"}, {day_->sunset, L"日落"}};
+    if (marks[1].minute < marks[0].minute) std::swap(marks[0], marks[1]);
+    const int leftLimit = trackStart;
+    const int rightLimit = timeBounds(clientWidth).left - scale(5);
+    const int textOffset = scale(15);
+    for (auto& mark : marks) {
+        if (mark.minute < 0) continue;
+        SIZE size{};
+        GetTextExtentPoint32W(dc, mark.text, 2, &size);
+        mark.width = textOffset + size.cx;
+        mark.anchor = trackStart + static_cast<int>(std::lround(mark.minute * trackWidth / minutesPerDay));
+        mark.left = std::clamp(mark.anchor - mark.width / 2, leftLimit, rightLimit - mark.width);
     }
+    if (marks[0].minute >= 0 && marks[1].minute >= 0) {
+        const int spacing = marks[0].width + scale(5);
+        const int overlap = marks[0].left + spacing - marks[1].left;
+        if (overlap > 0) {
+            const int lastStart = rightLimit - marks[1].width - spacing;
+            marks[0].left = std::clamp(marks[0].left - overlap / 2, leftLimit, lastStart);
+            marks[1].left = marks[0].left + spacing;
+        }
+    }
+    const auto pen = SelectObject(dc, GetStockObject(DC_PEN));
+    SetDCPenColor(dc, RGB(140, 112, 73));
+    for (const auto& mark : marks) {
+        if (mark.minute < 0) continue;
+        RECT title{mark.left + textOffset, scale(11), mark.left + mark.width, scale(28)};
+        DrawTextW(dc, mark.text, 2, &title, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        drawSunIcon(dc, mark.left + scale(6), scale(21), dpi_);
+        line(dc, mark.left + mark.width / 2, scale(27), mark.anchor, scale(30));
+    }
+    SelectObject(dc, pen);
     if (previous) SelectObject(dc, previous);
     if (font) DeleteObject(font);
 }
@@ -484,16 +674,22 @@ void App::paint(HDC target) {
 }
 
 void App::drawHideButton(const DRAWITEMSTRUCT& item) {
+    using namespace Gdiplus;
     const RECT bounds = item.rcItem;
-    const auto pen = SelectObject(item.hDC, GetStockObject(DC_PEN));
     fill(item.hDC, bounds, item.itemState & ODS_SELECTED ? RGB(79, 49, 48) : glassColor);
-    SetDCPenColor(item.hDC, RGB(160, 163, 166));
-    const int x = (bounds.left + bounds.right) / 2;
-    const int y = (bounds.top + bounds.bottom) / 2;
-    const int radius = scale(3);
-    line(item.hDC, x - radius, y - radius, x + radius + 1, y + radius + 1);
-    line(item.hDC, x - radius, y + radius, x + radius + 1, y - radius - 1);
-    SelectObject(item.hDC, pen);
+    if (!vectorGraphicsReady()) return;
+    Graphics canvas(item.hDC);
+    canvas.SetPageUnit(UnitPixel);
+    canvas.SetSmoothingMode(SmoothingModeAntiAlias);
+    canvas.SetPixelOffsetMode(PixelOffsetModeHalf);
+    const REAL unit = dpi_ / 96.0f;
+    Matrix transform(unit, 0, 0, unit, (bounds.left + bounds.right) * 0.5f,
+                     (bounds.top + bounds.bottom) * 0.5f);
+    canvas.SetTransform(&transform);
+    Pen pen(Color(255, 171, 174, 176), 1.15f);
+    pen.SetLineCap(LineCapRound, LineCapRound, DashCapFlat);
+    canvas.DrawLine(&pen, -3.25f, -3.25f, 3.25f, 3.25f);
+    canvas.DrawLine(&pen, -3.25f, 3.25f, 3.25f, -3.25f);
 }
 
 bool App::addTrayIcon() {
@@ -534,6 +730,7 @@ void App::useTaskbarButton(bool enabled) {
 
 void App::show() {
     ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOW);
+    placeWindow(false);
     refresh(true);
     SetForegroundWindow(window_);
 }
@@ -684,6 +881,9 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         dpi_ = GetDpiForWindow(window_);
         createControls();
         return 0;
+    case WM_WINDOWPOSCHANGED:
+        syncShadow();
+        break;
     case WM_DPICHANGED: {
         dpi_ = HIWORD(wParam);
         const RECT& bounds = *reinterpret_cast<const RECT*>(lParam);
@@ -703,6 +903,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_EXITSIZEMOVE:
+        placeWindow(false);
         rememberPosition();
         return 0;
     case WM_NCHITTEST: {
@@ -729,7 +930,12 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 1;
     case WM_PAINT: {
         PAINTSTRUCT paintInfo{};
-        paint(BeginPaint(window_, &paintInfo));
+        HDC dc = BeginPaint(window_, &paintInfo);
+        const RECT bounds = timeBounds(scale(baseWidth));
+        RECT inside{};
+        IntersectRect(&inside, &bounds, &paintInfo.rcPaint);
+        if (EqualRect(&inside, &paintInfo.rcPaint)) drawTime(dc, scale(baseWidth));
+        else paint(dc);
         EndPaint(window_, &paintInfo);
         return 0;
     }

@@ -56,11 +56,21 @@ COLORREF mix(COLORREF first, COLORREF second, double fraction) {
 
 } // namespace
 
-const std::array<Theme, 2> themes{{
+const std::array<Theme, 7> themes{{
     {L"白天与黑夜", {RGB(34, 103, 178), RGB(67, 147, 211), RGB(255, 76, 48),
                    RGB(255, 218, 80), RGB(255, 184, 74), RGB(242, 159, 57)}},
     {L"红紫蓝渐变", {RGB(255, 71, 40), RGB(248, 23, 61), RGB(233, 16, 166),
                    RGB(198, 55, 245), RGB(104, 113, 239), RGB(0, 148, 255)}},
+    {L"深蓝到薄荷", {RGB(38, 63, 176), RGB(23, 100, 205), RGB(12, 146, 209),
+                    RGB(14, 183, 193), RGB(53, 209, 172), RGB(142, 231, 184)}},
+    {L"绯红到金橙", {RGB(154, 31, 66), RGB(205, 43, 64), RGB(241, 72, 57),
+                    RGB(252, 118, 53), RGB(255, 162, 61), RGB(255, 212, 107)}},
+    {L"青柠到翡翠", {RGB(226, 227, 92), RGB(185, 222, 87), RGB(138, 213, 92),
+                    RGB(79, 194, 109), RGB(38, 166, 121), RGB(16, 133, 119)}},
+    {L"莓紫到蜜桃", {RGB(110, 46, 162), RGB(151, 57, 176), RGB(193, 73, 165),
+                    RGB(224, 101, 151), RGB(245, 142, 141), RGB(255, 188, 146)}},
+    {L"极光渐变", {RGB(35, 192, 137), RGB(26, 177, 180), RGB(41, 146, 223),
+                 RGB(75, 101, 219), RGB(125, 77, 209), RGB(190, 92, 221)}},
 }};
 
 std::vector<const City*> citiesFor(const wchar_t* zone) {
@@ -164,7 +174,7 @@ Instant Day::nextChange(int elapsed) const {
 COLORREF Day::color(double minute, int theme) const {
     const auto& colors = themes[theme].colors;
     minute = std::clamp(minute, 0.0, static_cast<double>(minutesPerDay));
-    if (theme == spectrumTheme) {
+    if (theme != daylightTheme) {
         const double position = minute * (colors.size() - 1) / minutesPerDay;
         const int left = std::min(static_cast<int>(position), static_cast<int>(colors.size()) - 2);
         return mix(colors[left], colors[left + 1], position - left);
