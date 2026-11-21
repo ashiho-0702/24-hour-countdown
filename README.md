@@ -4,7 +4,7 @@
 
 ![零点的完整表盘，从左到右是夜蓝、晨光、琥珀色的白天和暮色](docs/images/clock.png)
 
-**直接运行**　下载 [Windows x64 便携版](https://github.com/ashiho-0702/24-hour-countdown-/raw/refs/heads/main/dist/24HourCountdown.exe)，双击 `24HourCountdown.exe` 即可。设置保存在当前用户的 `%LOCALAPPDATA%\24HourCountdown\settings.ini`。
+**直接运行**　下载 [Windows x64 便携版](https://github.com/ashiho-0702/24-hour-countdown/raw/refs/heads/main/dist/24HourCountdown.exe)，双击 `24HourCountdown.exe` 即可。设置保存在当前用户的 `%LOCALAPPDATA%\24HourCountdown\settings.ini`。
 
 ## 灯珠里的小人
 
