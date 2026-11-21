@@ -10,5 +10,6 @@
 #define IDC_CITY      1002
 #define IDC_LATITUDE  1003
 #define IDC_LONGITUDE 1004
+#define IDC_AUTOSTART 1005
 
 #define IDC_HIDE      1101

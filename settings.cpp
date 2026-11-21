@@ -156,9 +156,23 @@ struct SettingsDialog {
         }
 
         const bool follow = SendDlgItemMessageW(window, IDC_ZONE, CB_GETCURSEL, 0, 0) <= 0;
-        preferences.zone = follow ? L"" : dialogZone(window).TimeZoneKeyName;
-        preferences.city = choice > 0 && !custom ? cities[choice - 1]->name : L"";
-        preferences.customCoordinates = custom;
+        Preferences updated = preferences;
+        updated.zone = follow ? L"" : dialogZone(window).TimeZoneKeyName;
+        updated.city = choice > 0 && !custom ? cities[choice - 1]->name : L"";
+        updated.customCoordinates = custom;
+        updated.startAtLogin = IsDlgButtonChecked(window, IDC_AUTOSTART) == BST_CHECKED;
+        if (setStartAtLogin(updated.startAtLogin) != ERROR_SUCCESS) {
+            MessageBoxW(window, L"无法更新当前用户的 Windows 启动项。", L"开机自动启动", MB_OK | MB_ICONWARNING);
+            return false;
+        }
+        if (!updated.save()) {
+            const bool restored = setStartAtLogin(preferences.startAtLogin) == ERROR_SUCCESS;
+            MessageBoxW(window, restored ? L"无法保存设置，请检查配置目录是否可写。"
+                                         : L"无法保存设置，也未能还原启动项。请检查权限后重试。",
+                        L"设置", MB_OK | MB_ICONWARNING);
+            return false;
+        }
+        preferences = updated;
         return true;
     }
 };
@@ -171,6 +185,7 @@ INT_PTR CALLBACK settingsProcedure(HWND window, UINT message, WPARAM wParam, LPA
         SendDlgItemMessageW(window, IDC_LONGITUDE, EM_SETLIMITTEXT, 32, 0);
         dialog->fillZones(window);
         dialog->fillCities(window);
+        CheckDlgButton(window, IDC_AUTOSTART, dialog->preferences.startAtLogin ? BST_CHECKED : BST_UNCHECKED);
         return TRUE;
     }
     if (message != WM_COMMAND) return FALSE;
@@ -194,6 +209,28 @@ INT_PTR CALLBACK settingsProcedure(HWND window, UINT message, WPARAM wParam, LPA
 
 } // namespace
 
+LSTATUS setStartAtLogin(bool enabled) {
+    constexpr wchar_t key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    constexpr wchar_t name[] = L"24HourCountdown";
+    if (!enabled) {
+        const LSTATUS status = RegDeleteKeyValueW(HKEY_CURRENT_USER, key, name);
+        return status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND ? ERROR_SUCCESS : status;
+    }
+
+    // Windows Run entries accept a command line of up to 260 characters, including quotes.
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+    if (!length) return GetLastError();
+    if (length + 2 > MAX_PATH) return ERROR_FILENAME_EXCED_RANGE;
+    const std::wstring command = L"\"" + std::wstring(path, length) + L"\"";
+    wchar_t existing[MAX_PATH + 1]{};
+    DWORD size = sizeof(existing);
+    if (RegGetValueW(HKEY_CURRENT_USER, key, name, RRF_RT_REG_SZ, nullptr, existing, &size) == ERROR_SUCCESS
+        && command == existing) return ERROR_SUCCESS;
+    return RegSetKeyValueW(HKEY_CURRENT_USER, key, name, REG_SZ, command.c_str(),
+                           static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+}
+
 Preferences Preferences::load() {
     Preferences result;
     const auto path = preferencesPath();
@@ -207,6 +244,7 @@ Preferences Preferences::load() {
     result.city = read(L"City");
     result.theme = std::clamp(_wtoi(read(L"Theme").c_str()), 0, static_cast<int>(themes.size()) - 1);
     result.topmost = read(L"Topmost") != L"0";
+    result.startAtLogin = read(L"StartAtLogin") != L"0";
     const auto left = read(L"Left");
     const auto top = read(L"Top");
     if (!left.empty() && !top.empty()) result.position = POINT{_wtol(left.c_str()), _wtol(top.c_str())};
@@ -246,6 +284,7 @@ bool Preferences::save() const {
     add(L"City", city);
     add(L"Theme", std::to_wstring(theme));
     add(L"Topmost", topmost ? L"1" : L"0");
+    add(L"StartAtLogin", startAtLogin ? L"1" : L"0");
     if (position) {
         add(L"Left", std::to_wstring(position->x));
         add(L"Top", std::to_wstring(position->y));

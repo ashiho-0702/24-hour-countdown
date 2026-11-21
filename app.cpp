@@ -251,6 +251,10 @@ bool App::create() {
                               window_, nullptr, instance_, nullptr);
     useTaskbarButton(!addTrayIcon());
     show();
+    if (setStartAtLogin(preferences_.startAtLogin) != ERROR_SUCCESS) {
+        MessageBoxW(window_, L"未能应用开机自启设置。可在右键菜单的「设置」中重试。",
+                    L"开机自动启动", MB_OK | MB_ICONWARNING);
+    }
     return true;
 }
 
@@ -985,7 +989,7 @@ void App::menu(POINT position, bool fromTray) {
 
     if (fromTray) AppendMenuW(popup, MF_STRING, menuShow, L"显示小窗");
     AppendMenuW(popup, MF_STRING | (preferences_.topmost ? MF_CHECKED : 0), menuTopmost, L"置顶");
-    AppendMenuW(popup, MF_STRING, menuSettings, L"时区与日照地点…");
+    AppendMenuW(popup, MF_STRING, menuSettings, L"设置…");
     AppendMenuW(popup, MF_STRING, menuTheme, L"配色…");
     AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
     if (IsWindowVisible(window_)) AppendMenuW(popup, MF_STRING, menuHide, L"关闭小窗");
@@ -1018,7 +1022,6 @@ void App::command(UINT id) {
         if (settingsOpen_) break;
         settingsOpen_ = true;
         if (editPreferences(instance_, window_, preferences_)) {
-            preferences_.save();
             refresh(true);
         }
         settingsOpen_ = false;
