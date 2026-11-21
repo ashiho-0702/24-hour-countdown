@@ -1,4 +1,5 @@
 #include "clock.h"
+#include "busy_person.h"
 #include "resources.h"
 #include "settings.h"
 
@@ -19,10 +20,16 @@ constexpr wchar_t instanceName[] = L"Local\\Countdown.Desktop.425CA4A2";
 constexpr UINT trayMessage = WM_APP + 1;
 constexpr UINT restoreMessage = WM_APP + 2;
 constexpr UINT_PTR tickTimer = 1;
+constexpr UINT_PTR personTimer = 2;
+constexpr UINT poseIntervalMs = 125;
+constexpr double fadeCells = 1.25;
 constexpr int baseWidth = 746;
 constexpr int baseHeight = 115;
 constexpr int cornerDiameter = 21;
 constexpr int numeralTop = 31;
+constexpr int thoughtFontSize = 14;
+constexpr int lampTop = 66;
+constexpr int lampBottom = 99;
 constexpr COLORREF caseColor = RGB(43, 46, 51);
 constexpr COLORREF glassColor = RGB(11, 12, 15);
 constexpr COLORREF scaleInk = RGB(227, 226, 220);
@@ -102,21 +109,18 @@ double referenceCell(const Day& day, double minute) {
     return wrap(position, cellCount);
 }
 
-COLORREF sampleLens(double cell, double u, double v) {
-    const int first = static_cast<int>(cell);
+COLORREF sampleDiffuser(int index, double u, double v) {
     const int column = std::min(3, static_cast<int>(u * 4));
     const int row = std::min(7, static_cast<int>(v * 8));
-    const auto sample = [&](int index) {
-        const auto& grid = lensSamples[index];
-        const double x = u * 4 - column;
-        return blend(blend(grid[row][column], grid[row][column + 1], x),
-                     blend(grid[row + 1][column], grid[row + 1][column + 1], x), v * 8 - row);
-    };
-    const COLORREF tint = blend(sample(first), sample((first + 1) % cellCount), cell - first);
-    const double blue = std::clamp((GetBValue(tint) - GetRValue(tint)) / 24.0, 0.0, 1.0);
-    const double shadows = std::clamp((150 - GetBValue(tint)) / 120.0, 0.0, 1.0);
-    const double core = 1.0 - (u - 0.5) * (u - 0.5) - (v - 0.4) * (v - 0.4);
-    return blend(tint, RGB(62, 112, 166), blue * shadows * (0.58 + 0.30 * core));
+    const auto& grid = lensSamples[index];
+    const double x = u * 4 - column;
+    return blend(blend(grid[row][column], grid[row][column + 1], x),
+                 blend(grid[row + 1][column], grid[row + 1][column + 1], x), v * 8 - row);
+}
+
+COLORREF sampleLens(double cell, double u, double v) {
+    const int first = static_cast<int>(cell);
+    return blend(sampleDiffuser(first, u, v), sampleDiffuser((first + 1) % cellCount, u, v), cell - first);
 }
 
 const std::vector<DWORD>& drawMetalCase(HDC dc, RECT client) {
@@ -179,7 +183,16 @@ private:
     void syncShadow();
     void rememberPosition();
     void refresh(bool rebuild = false, bool forPreview = false);
-    void paint(HDC target);
+    void paint(HDC target, const RECT* damage = nullptr);
+    RECT personBounds() const;
+    RECT personPaintBounds(RECT figure) const;
+    bool hitPerson(POINT point) const;
+    RECT thoughtBounds(RECT figure) const;
+    void drawThought(HDC dc, RECT bubble, RECT figure) const;
+    void updatePerson(bool clicked);
+    void drawPerson(HDC target, RECT bounds);
+    int firstWholeCell() const;
+    void clearFaceCache();
     RECT timeBounds(int clientWidth) const;
     void drawTime(HDC dc, int clientWidth) const;
     void drawFace(HDC dc, const RECT& client, int theme, double elapsed);
@@ -211,6 +224,13 @@ private:
     DYNAMIC_TIME_ZONE_INFORMATION zone_{};
     SYSTEMTIME localDate_{};
     double elapsed_ = 0;
+    BusyPerson person_;
+    HDC faceDC_ = nullptr;
+    HBITMAP faceBitmap_ = nullptr;
+    DWORD* facePixels_ = nullptr;
+    SIZE faceSize_{};
+    bool faceDirty_ = true;
+    std::vector<DWORD> personPixels_;
     bool hasTrayIcon_ = false;
     bool trayVersion4_ = false;
     bool settingsOpen_ = false;
@@ -272,6 +292,7 @@ RECT App::closeButtonBounds(int clientWidth) const {
 }
 
 void App::updateGeometry() {
+    faceDirty_ = true;
     RECT client{};
     GetClientRect(window_, &client);
     const int diameter = scale(cornerDiameter);
@@ -382,16 +403,21 @@ void App::refresh(bool rebuild, bool forPreview) {
         if (duration > 0) newlyElapsed += std::clamp(static_cast<double>(minute - start) / duration, 0.0, 1.0);
     }
     if (rebuild || newlyElapsed != elapsed_) {
+        faceDirty_ = true;
         InvalidateRect(window_, nullptr, FALSE);
     } else if (local.wMinute != localDate_.wMinute ||
                local.wHour != localDate_.wHour) {
+        faceDirty_ = true;
         const RECT bounds = timeBounds(scale(baseWidth));
         InvalidateRect(window_, &bounds, FALSE);
     }
     localDate_ = local;
     elapsed_ = newlyElapsed;
+    person_.fit(firstWholeCell());
 
     if (!visible) return;
+    if (person_.position >= 0) SetTimer(window_, personTimer, poseIntervalMs, nullptr);
+    else KillTimer(window_, personTimer);
     SetTimer(window_, tickTimer, (60 - local.wSecond) * 1000 - local.wMilliseconds, nullptr);
 }
 
@@ -460,8 +486,8 @@ void App::drawFace(HDC dc, const RECT& client, int theme, double elapsed) {
 
 void App::drawLamps(HDC dc, int trackStart, int trackWidth, int theme, double elapsed,
                     const std::vector<DWORD>& metal, const RECT& client) {
-    const int top = scale(69);
-    const int bottom = scale(95);
+    const int top = scale(lampTop);
+    const int bottom = scale(lampBottom);
     const int halo = std::max(1, scale(7));
     const auto tickX = [trackStart, trackWidth](int tick) {
         return trackStart + MulDiv(trackWidth, tick, cellCount);
@@ -477,29 +503,63 @@ void App::drawLamps(HDC dc, int trackStart, int trackWidth, int theme, double el
                   bottom + scale(2)}, scale(5), RGB(5, 7, 9), RGB(3, 4, 6));
     const double boundary = trackStart + trackWidth * elapsed / cellCount;
     const int lightStart = static_cast<int>(std::floor(boundary));
-    const double fadeWidth = std::min(boundary - trackStart, 1.25 * trackWidth / cellCount);
+    const double fadeWidth = std::min(boundary - trackStart, fadeCells * trackWidth / cellCount);
     const auto brightnessAt = [&](int x) {
         if (fadeWidth <= 0) return 1.0;
         const double t = std::clamp((x + 0.5 - boundary) / fadeWidth, 0.0, 1.0);
         return t * t * (3.0 - 2.0 * t);
     };
     if (day_) {
+        // Integrate each diffuser across the brushed bevel, including the end caps.
+        const double pitch = static_cast<double>(trackWidth) / cellCount;
+        const double spread = 1.65 * pitch;
+        struct Emitter { COLORREF tint; double power; };
+        std::array<Emitter, cellCount> emitters{};
+        for (int cell = 0; cell < cellCount; ++cell) {
+            const int left = tickX(cell), width = tickX(cell + 1) - left;
+            const COLORREF tint = colorAt(left + width / 2);
+            const double light = (brightnessAt(left + width / 4) + brightnessAt(left + 3 * width / 4)) / 2;
+            emitters[cell] = {tint, light * (0.40 + warmth(tint) * 0.22)};
+        }
+        const int bevelTop = scale(baseHeight - 10), bevelCenter = scale(baseHeight - 7);
+        const int sideWidth = scale(10), lampCenter = (top + bottom) / 2;
+        for (int x = 0; x < client.right; ++x) {
+            const int nearest = static_cast<int>(std::floor((x - trackStart) / pitch));
+            double power = 0, red = 0, green = 0, blue = 0;
+            for (int i = std::max(0, nearest - 5); i <= std::min(cellCount - 1, nearest + 5); ++i) {
+                const double dx = (x + 0.5 - trackStart - (i + 0.5) * pitch) / spread;
+                const double weight = std::exp(-dx * dx) * emitters[i].power;
+                const COLORREF tint = emitters[i].tint;
+                power += weight;
+                red += weight * GetRValue(tint);
+                green += weight * GetGValue(tint);
+                blue += weight * GetBValue(tint);
+            }
+            if (power <= 0) continue;
+            const COLORREF tint = RGB(red / power, green / power, blue / power);
+            const int edge = std::min<int>(x, client.right - 1 - x);
+            const double side = (edge - scale(6)) / static_cast<double>(scale(4));
+            const double across = std::exp(-side * side);
+            const int firstY = edge < sideWidth ? top - scale(22) : bevelTop;
+            for (int y = firstY; y < std::min<int>(client.bottom, scale(baseHeight - 1)); ++y) {
+                const double depth = (y - bevelCenter) / static_cast<double>(scale(3));
+                const double along = (y - lampCenter) / static_cast<double>(scale(22));
+                const double profile = std::max(std::exp(-depth * depth), 2.0 * across * std::exp(-along * along));
+                const double amount = power * pitch / (1.77245 * spread) * profile;
+                const DWORD base = metal[static_cast<size_t>(y) * client.right + x];
+                const COLORREF steel = RGB(GetBValue(base), GetGValue(base), GetRValue(base));
+                SetPixelV(dc, x, y, blend(steel, tint, amount));
+            }
+        }
         for (int x = lightStart; x < std::min<int>(client.right, tickX(cellCount)); ++x) {
             const COLORREF tint = colorAt(x);
             const double strength = 0.40 + warmth(tint) * 0.22;
             const double onset = brightnessAt(x);
-            for (int y = scale(baseHeight - 10); y < std::min<int>(client.bottom, scale(baseHeight - 1)); ++y) {
-                const DWORD base = metal[static_cast<size_t>(y) * client.right + x];
-                const COLORREF steel = RGB(GetBValue(base), GetGValue(base), GetRValue(base));
-                const double distance = (y - scale(baseHeight - 7)) / static_cast<double>(scale(3));
-                const double reflection = onset * strength * std::exp(-distance * distance);
-                SetPixelV(dc, x, y, blend(steel, tint, reflection));
-            }
             for (int band = 0; band < halo; ++band) {
                 const double fade = 1.0 - static_cast<double>(band) / halo;
                 const COLORREF glow = blend(glassColor, tint, onset * strength * fade * fade);
                 SetPixelV(dc, x, top - 1 - band, glow);
-                SetPixelV(dc, x, bottom + band, glow);
+                if (bottom + band < bevelTop) SetPixelV(dc, x, bottom + band, glow);
             }
         }
     }
@@ -509,37 +569,32 @@ void App::drawLamps(HDC dc, int trackStart, int trackWidth, int theme, double el
         const int right = tickX(cell + 1);
         const RECT lens{left, top, right, bottom};
         if (!day_ || right <= lightStart) {
-            roundRect(dc, lens, scale(3), RGB(3, 5, 7), RGB(14, 16, 20));
+            roundRect(dc, lens, scale(4), RGB(3, 5, 7), RGB(14, 16, 20));
             continue;
         }
         const COLORREF mid = colorAt((left + right) / 2);
-        roundRect(dc, lens, scale(3), blend(glassColor, mid, 0.63), blend(glassColor, mid, 0.46));
         const int width = right - left;
         const int height = bottom - top;
-        if (reference) {
-            const double minute = (cell + 0.5) * minutesPerCell;
-            const double position = referenceCell(*day_, minute);
-            for (int y = top + 1; y < bottom - 1; ++y) {
-                const double v = (y - top + 0.5) / height;
-                for (int x = left + 1; x < right - 1; ++x) {
-                    const double u = (x - left + 0.5) / width;
-                    SetPixelV(dc, x, y, sampleLens(position, u, v));
+        const double position = reference ? referenceCell(*day_, (cell + 0.5) * minutesPerCell) : 0;
+        const double radius = scale(2);
+        const COLORREF edge = blend(glassColor, mid, 0.68);
+        const COLORREF center = blend(mid, RGB(253, 246, 225), 0.30);
+        for (int y = top; y < bottom; ++y) {
+            const double v = (y - top + 0.5) / height;
+            for (int x = left; x < right; ++x) {
+                const double u = (x - left + 0.5) / width;
+                COLORREF color;
+                if (reference) {
+                    color = sampleLens(position, u, v);
+                } else {
+                    // Transfer the measured shading of an amber lens to the selected hue.
+                    const double light = (GetGValue(sampleDiffuser(22, u, v)) - 120) / 86.0;
+                    color = blend(edge, center, std::clamp(light, 0.0, 1.0));
                 }
-            }
-            continue;
-        }
-        for (int x = left + 1; x < right - 1; ++x) {
-            const COLORREF tint = colorAt(x);
-            const double warm = warmth(tint);
-            const double side = std::abs(2.0 * (x - left + 0.5) / width - 1.0);
-            const COLORREF highlight = blend(RGB(179, 225, 255), RGB(255, 249, 215), warm);
-            const COLORREF center = blend(tint, highlight, theme == daylightTheme ? 0.62 : 0.10);
-            const COLORREF edge = blend(glassColor, tint, 0.88);
-            for (int y = top + 1; y < bottom - 1; ++y) {
-                const double position = static_cast<double>(y - top) / height;
-                const double distance = (position - 0.26) / 0.62;
-                const double falloff = std::clamp(0.52 * distance * distance + 0.25 * side * side, 0.0, 1.0);
-                SetPixelV(dc, x, y, blend(center, edge, falloff));
+                const double dx = std::max(0.0, radius - std::min(x - left + 0.5, right - x - 0.5));
+                const double dy = std::max(0.0, radius - std::min(y - top + 0.5, bottom - y - 0.5));
+                const double coverage = std::clamp(radius + 0.5 - std::hypot(dx, dy), 0.0, 1.0);
+                SetPixelV(dc, x, y, blend(RGB(5, 7, 9), color, coverage));
             }
         }
     }
@@ -656,23 +711,198 @@ void App::drawSolarMarks(HDC dc, int trackStart, int trackWidth, int clientWidth
     if (font) DeleteObject(font);
 }
 
-void App::paint(HDC target) {
-    RECT client{};
-    GetClientRect(window_, &client);
-    const HDC buffer = CreateCompatibleDC(target);
-    const HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target, client.right, client.bottom) : nullptr;
-    if (bitmap) {
-        const auto original = SelectObject(buffer, bitmap);
-        drawFace(buffer, client, preferences_.theme, elapsed_);
-        BitBlt(target, 0, 0, client.right, client.bottom, buffer, 0, 0, SRCCOPY);
-        SelectObject(buffer, original);
-        DeleteObject(bitmap);
-    } else {
-        drawFace(target, client, preferences_.theme, elapsed_);
-    }
-    if (buffer) DeleteDC(buffer);
+int App::firstWholeCell() const {
+    // The fade reaches into the lit side. Both the figure and its props must clear it.
+    return std::min(cellCount, static_cast<int>(std::ceil(elapsed_ + std::min(elapsed_, fadeCells))));
 }
 
+RECT App::personBounds() const {
+    if (person_.position < 0) return {};
+    const int trackStart = scale(22), trackWidth = scale(724) - trackStart;
+    const int width = std::min(scale(Silhouette::width), trackWidth / cellCount);
+    const int center = trackStart + static_cast<int>(std::lround((person_.position + 0.5) * trackWidth / cellCount));
+    const int firstPixel = trackStart + MulDiv(trackWidth, firstWholeCell(), cellCount) + scale(1);
+    const int left = std::max(firstPixel, std::min(center - width / 2, scale(724) - width));
+    const int feet = scale(lampBottom - 1);
+    return {left, feet - scale(Silhouette::height), std::min(left + width, scale(724)), feet};
+}
+
+void App::clearFaceCache() {
+    if (faceDC_) DeleteDC(faceDC_);
+    if (faceBitmap_) DeleteObject(faceBitmap_);
+    faceDC_ = nullptr;
+    faceBitmap_ = nullptr;
+    facePixels_ = nullptr;
+    faceSize_ = {};
+    faceDirty_ = true;
+}
+
+RECT App::personPaintBounds(RECT figure) const {
+    if (IsRectEmpty(&figure)) return {};
+    return {figure.left - scale(6), figure.top, figure.right + scale(6), scale(baseHeight - 1)};
+}
+
+bool App::hitPerson(POINT point) const {
+    RECT hit = personBounds();
+    if (IsRectEmpty(&hit)) return false;
+    InflateRect(&hit, scale(2), scale(2));
+    return PtInRect(&hit, point) != FALSE;
+}
+
+RECT App::thoughtBounds(RECT figure) const {
+    if (!person_.thought || IsRectEmpty(&figure)) return {};
+    int textWidth = 0;
+    for (const wchar_t* p = person_.thought; *p; ++p)
+        textWidth += *p < 128 ? thoughtFontSize / 2 : thoughtFontSize;
+    const int width = scale(textWidth + 16);
+    const int center = (figure.left + figure.right) / 2;
+    const int left = std::clamp(center - width / 2, scale(12), scale(baseWidth - 12) - width);
+    return {left, figure.top - scale(28), left + width, figure.top - scale(1)};
+}
+
+void App::drawThought(HDC dc, RECT bubble, RECT figure) const {
+    using namespace Gdiplus;
+    const int saved = SaveDC(dc);
+    if (!saved) return;
+    RECT body = bubble;
+    body.bottom -= scale(5);
+    if (vectorGraphicsReady()) {
+        Graphics canvas(dc);
+        canvas.SetPageUnit(UnitPixel);
+        canvas.SetSmoothingMode(SmoothingModeAntiAlias);
+        const REAL stroke = dpi_ / 96.0f;
+        const REAL inset = stroke * 0.5f + 0.5f;
+        const REAL left = body.left + inset, top = body.top + inset;
+        const REAL right = body.right - inset, bottom = body.bottom - inset;
+        const REAL diameter = 8 * stroke;
+        const REAL anchor = (figure.left + figure.right) * 0.5f;
+        const REAL tail = std::clamp(anchor, left + diameter, right - diameter);
+        GraphicsPath outline;
+        outline.AddArc(left, top, diameter, diameter, 180, 90);
+        outline.AddArc(right - diameter, top, diameter, diameter, 270, 90);
+        outline.AddArc(right - diameter, bottom - diameter, diameter, diameter, 0, 90);
+        outline.AddLine(tail + 4 * stroke, bottom, anchor, bubble.bottom - inset);
+        outline.AddLine(anchor, bubble.bottom - inset, tail - 3 * stroke, bottom);
+        outline.AddArc(left, bottom - diameter, diameter, diameter, 90, 90);
+        outline.CloseFigure();
+        SolidBrush white(Color(255, 255, 255));
+        Pen silver(Color(161, 167, 174), stroke);
+        silver.SetLineJoin(LineJoinRound);
+        canvas.FillPath(&white, &outline);
+        canvas.DrawPath(&silver, &outline);
+    } else {
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SelectObject(dc, GetStockObject(DC_PEN));
+        roundRect(dc, body, scale(8), RGB(255, 255, 255), RGB(161, 167, 174));
+    }
+    const HFONT font = CreateFontW(-scale(thoughtFontSize), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                   DEFAULT_PITCH | FF_ROMAN, L"KaiTi");
+    if (font) SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(40, 44, 49));
+    DrawTextW(dc, person_.thought, -1, &body, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RestoreDC(dc, saved);
+    if (font) DeleteObject(font);
+}
+
+void App::updatePerson(bool clicked) {
+    const RECT oldFigure = personBounds();
+    const RECT oldPaint = personPaintBounds(oldFigure), oldBubble = thoughtBounds(oldFigure);
+    const auto* oldText = person_.thought;
+    if (clicked) person_.click(firstWholeCell());
+    else person_.advance(firstWholeCell());
+    const RECT figure = personBounds(), painted = personPaintBounds(figure), bubble = thoughtBounds(figure);
+    RECT dirty{};
+    if (UnionRect(&dirty, &oldPaint, &painted)) InvalidateRect(window_, &dirty, FALSE);
+    if (oldText != person_.thought || !EqualRect(&oldBubble, &bubble)) {
+        if (UnionRect(&dirty, &oldBubble, &bubble)) InvalidateRect(window_, &dirty, FALSE);
+    }
+}
+
+void App::drawPerson(HDC target, RECT figure) {
+    const RECT bounds = personPaintBounds(figure);
+    const int width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
+    if (width <= 0 || height <= 0 || bounds.right > faceSize_.cx || bounds.bottom > faceSize_.cy) return;
+    const auto mask = pose(person_.activity, person_.frame);
+    const int figureWidth = figure.right - figure.left, figureHeight = figure.bottom - figure.top;
+    const auto occupied = [&](int col, int row) {
+        if (col < 0 || col >= Silhouette::width || row < 0 || row >= Silhouette::height) return false;
+        if (!person_.facingRight) col = Silhouette::width - 1 - col;
+        return (mask.rows[row] & (1u << col)) != 0;
+    };
+    personPixels_.resize(static_cast<size_t>(width) * height);
+    const int sill = scale(lampBottom);
+    for (int y = bounds.top; y < bounds.bottom; ++y) {
+        const DWORD* lamp = facePixels_ + y * faceSize_.cx + bounds.left;
+        const double depth = std::max(0, y - sill) / static_cast<double>(bounds.bottom - sill);
+        const double softness = 1.4 + 3.2 * depth;
+        const int shadowRow = static_cast<int>((1.0 - depth) * (Silhouette::height - 1));
+        for (int x = bounds.left; x < bounds.right; ++x) {
+            int transmission = 256;
+            if (y < figure.bottom && x >= figure.left && x < figure.right) {
+                if (occupied((x - figure.left) * Silhouette::width / figureWidth,
+                             (y - figure.top) * Silhouette::height / figureHeight)) transmission = 80;
+            } else if (y >= sill) {
+                // Project this pose feet-first onto the sill. The penumbra widens with distance.
+                const double col = ((x + 0.5 - figure.left) / figureWidth - 0.5)
+                                   * Silhouette::width / (1.0 + 0.27 * depth) + Silhouette::width / 2.0 - 0.5;
+                double blocked = 0, total = 0;
+                for (int tap = static_cast<int>(std::ceil(col - softness)); tap <= col + softness; ++tap) {
+                    const double weight = 1.0 - std::abs(tap - col) / softness;
+                    total += weight;
+                    blocked += weight * (0.25 * occupied(tap, shadowRow - 1) + 0.5 * occupied(tap, shadowRow)
+                                       + 0.25 * occupied(tap, shadowRow + 1));
+                }
+                transmission -= static_cast<int>(blocked / total * (0.70 - 0.30 * depth) * 256);
+            }
+            const DWORD color = lamp[x - bounds.left];
+            const auto shade = [transmission](DWORD c) { return ((c & 255) * transmission + 128) >> 8; };
+            personPixels_[(y - bounds.top) * width + x - bounds.left] =
+                (shade(color >> 16) << 16) | (shade(color >> 8) << 8) | shade(color);
+        }
+    }
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB};
+    SetDIBitsToDevice(target, bounds.left, bounds.top, width, height, 0, 0, 0, height,
+                      personPixels_.data(), &info, DIB_RGB_COLORS);
+}
+
+void App::paint(HDC target, const RECT* damage) {
+    RECT client{};
+    GetClientRect(window_, &client);
+    if (IsRectEmpty(&client)) return;
+    if (client.right != faceSize_.cx || client.bottom != faceSize_.cy) {
+        clearFaceCache();
+        BITMAPINFO info{};
+        info.bmiHeader = {sizeof(BITMAPINFOHEADER), client.right, -client.bottom, 1, 32, BI_RGB};
+        void* pixels = nullptr;
+        faceDC_ = CreateCompatibleDC(target);
+        faceBitmap_ = CreateDIBSection(target, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        if (!faceDC_ || !faceBitmap_) {
+            clearFaceCache();
+            drawFace(target, client, preferences_.theme, elapsed_);
+            return;
+        }
+        SelectObject(faceDC_, faceBitmap_);
+        facePixels_ = static_cast<DWORD*>(pixels);
+        faceSize_ = {client.right, client.bottom};
+    }
+    if (faceDirty_) {
+        drawFace(faceDC_, client, preferences_.theme, elapsed_);
+        GdiFlush();
+        faceDirty_ = false;
+    }
+    const RECT dirty = damage ? *damage : client;
+    BitBlt(target, dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top,
+           faceDC_, dirty.left, dirty.top, SRCCOPY);
+    const RECT sprite = personBounds();
+    const RECT painted = personPaintBounds(sprite);
+    RECT overlap{};
+    if (IntersectRect(&overlap, &dirty, &painted)) drawPerson(target, sprite);
+    const RECT bubble = thoughtBounds(sprite);
+    if (IntersectRect(&overlap, &dirty, &bubble)) drawThought(target, bubble, sprite);
+}
 void App::drawHideButton(const DRAWITEMSTRUCT& item) {
     using namespace Gdiplus;
     const RECT bounds = item.rcItem;
@@ -738,6 +968,7 @@ void App::show() {
 void App::hide() {
     rememberPosition();
     KillTimer(window_, tickTimer);
+    KillTimer(window_, personTimer);
     const bool canUseTray = addTrayIcon();
     useTaskbarButton(!canUseTray);
     ShowWindow(window_, canUseTray ? SW_HIDE : SW_MINIMIZE);
@@ -805,6 +1036,7 @@ void App::command(UINT id) {
         settingsOpen_ = false;
         if (choice >= 1 && choice <= static_cast<INT_PTR>(themes.size())) {
             preferences_.theme = static_cast<int>(choice - 1);
+            faceDirty_ = true;
             preferences_.save();
             if (IsWindowVisible(window_)) InvalidateRect(window_, nullptr, FALSE);
         }
@@ -898,6 +1130,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED) {
             KillTimer(window_, tickTimer);
+            KillTimer(window_, personTimer);
         } else if (wParam == SIZE_RESTORED && IsWindowVisible(window_)) {
             refresh();
         }
@@ -910,8 +1143,14 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         RECT closeBounds{};
         const POINT pointer{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         if (GetWindowRect(hideButton_, &closeBounds) && PtInRect(&closeBounds, pointer)) return HTCLIENT;
+        POINT client = pointer;
+        if (ScreenToClient(window_, &client) && hitPerson(client)) return HTCLIENT;
         return HTCAPTION;
     }
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        if (hitPerson({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)})) updatePerson(true);
+        return 0;
     case WM_NCLBUTTONDBLCLK:
         return 0;
     case WM_NCRBUTTONUP:
@@ -931,11 +1170,7 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_PAINT: {
         PAINTSTRUCT paintInfo{};
         HDC dc = BeginPaint(window_, &paintInfo);
-        const RECT bounds = timeBounds(scale(baseWidth));
-        RECT inside{};
-        IntersectRect(&inside, &bounds, &paintInfo.rcPaint);
-        if (EqualRect(&inside, &paintInfo.rcPaint)) drawTime(dc, scale(baseWidth));
-        else paint(dc);
+        paint(dc, &paintInfo.rcPaint);
         EndPaint(window_, &paintInfo);
         return 0;
     }
@@ -953,6 +1188,9 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_TIMER:
         if (wParam == tickTimer) refresh();
+        if (wParam == personTimer && IsWindowVisible(window_) && !IsIconic(window_)) {
+            updatePerson(false);
+        }
         return 0;
     case WM_TIMECHANGE:
     case WM_SETTINGCHANGE:
@@ -978,7 +1216,9 @@ LRESULT App::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         hide();
         return 0;
     case WM_DESTROY:
+        clearFaceCache();
         KillTimer(window_, tickTimer);
+        KillTimer(window_, personTimer);
         removeTrayIcon();
         PostQuitMessage(0);
         return 0;
